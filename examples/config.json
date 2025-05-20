@@ -1,0 +1,60 @@
+{
+    "topology": {
+      "num_fog_nodes": 3,
+      "num_edge_nodes_per_fog": 2,
+      "custom_latencies": {
+        "cloud-fog-0": 20,
+        "cloud-fog-1": 25,
+        "cloud-fog-2": 30,
+        "fog-0-edge-0-0": 5,
+        "fog-0-edge-0-1": 8,
+        "fog-1-edge-1-0": 5,
+        "fog-1-edge-1-1": 8,
+        "fog-2-edge-2-0": 5,
+        "fog-2-edge-2-1": 8,
+        "fog-0-fog-1": 15,
+        "fog-0-fog-2": 20,
+        "fog-1-fog-2": 18
+      }
+    },
+    "functions": [
+      {
+        "name": "python-pi",
+        "image": "python-pi-cpu",
+        "image_size": 58000000,
+        "cpu": 200,
+        "memory": 268435456,
+        "weight": 0.5,
+        "min_replicas": 2,
+        "max_replicas": 5
+      },
+      {
+        "name": "resnet50-inference",
+        "image": "resnet50-inference-cpu",
+        "image_size": 56000000,
+        "cpu": 500,
+        "memory": 1073741824,
+        "weight": 0.5,
+        "min_replicas": 1,
+        "max_replicas": 3
+      }
+    ],
+    "benchmark": {
+      "total_requests": 100,
+      "rps": 10,
+      "request_pattern": "constant",
+      "source_distribution": {
+        "cloud": 0.2,
+        "fog-0": 0.3,
+        "fog-1": 0.3,
+        "fog-2": 0.2
+      }
+    },
+    "scheduler": {
+      "weights": {
+        "alpha": 0.4,
+        "beta": 0.2,
+        "gamma": 0.4
+      }
+    }
+  }
