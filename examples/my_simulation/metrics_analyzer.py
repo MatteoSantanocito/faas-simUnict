@@ -3,6 +3,7 @@ import os
 import json
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
 from datetime import datetime
 from typing import Dict, Any
@@ -154,17 +155,62 @@ class MetricsAnalyzer:
                 f.write(json.dumps(config, indent=2))
     
     def _plot_response_time_distribution(self, df: pd.DataFrame, timestamp: str):
+        
         """Genera un grafico della distribuzione del tempo di risposta."""
         if 'response_time' not in df.columns:
             return
         
         plt.figure(figsize=(12, 6))
-        sns.histplot(df['response_time'], kde=True, bins=30, color='skyblue')
-        plt.title('Distribuzione del Tempo di Risposta')
+        
+        # Controlla il range dei dati
+        resp_min = df['response_time'].min()
+        resp_max = df['response_time'].max()
+        resp_range = resp_max - resp_min
+        
+        if resp_range < 1e-10:  # Se la gamma è troppo piccola
+            plt.bar(['Response Time'], [df['response_time'].mean()], color='skyblue')
+            plt.text(0, df['response_time'].mean(), f"{df['response_time'].mean():.4f}", 
+                    ha='center', va='bottom')
+            plt.title('Response Time (constant value)')
+        else:
+            # Usa un numero appropriato di bin
+            n_bins = min(30, max(5, int(1 + 3.322 * np.log10(len(df)))))
+            sns.histplot(df['response_time'], kde=True, bins=n_bins, color='skyblue')
+            plt.title('Distribuzione del Tempo di Risposta')
+        
         plt.xlabel('Tempo di risposta (ms)')
         plt.ylabel('Frequenza')
         plt.tight_layout()
         plt.savefig(f"{self.output_dir}/response_time_distribution_{timestamp}.png")
+        plt.close()
+
+    def _plot_wait_time_distribution(self, df: pd.DataFrame, timestamp: str):
+        """Genera un grafico della distribuzione del tempo di attesa."""
+        if 't_wait' not in df.columns:
+            return
+        
+        plt.figure(figsize=(12, 6))
+        
+        # Controlla il range dei dati
+        wait_min = df['t_wait'].min()
+        wait_max = df['t_wait'].max()
+        wait_range = wait_max - wait_min
+        
+        if wait_range < 1e-10:  # Se la gamma è troppo piccola
+            plt.bar(['Wait Time'], [df['t_wait'].mean()], color='lightgreen')
+            plt.text(0, df['t_wait'].mean(), f"{df['t_wait'].mean():.4f}", 
+                    ha='center', va='bottom')
+            plt.title('Wait Time (constant value)')
+        else:
+            # Usa un numero appropriato di bin
+            n_bins = min(30, max(5, int(1 + 3.322 * np.log10(len(df)))))
+            sns.histplot(df['t_wait'], kde=True, bins=n_bins, color='lightgreen')
+            plt.title('Distribuzione del Tempo di Attesa')
+        
+        plt.xlabel('Tempo di attesa (ms)')
+        plt.ylabel('Frequenza')
+        plt.tight_layout()
+        plt.savefig(f"{self.output_dir}/wait_time_distribution_{timestamp}.png")
         plt.close()
     
     def _plot_execution_time_distribution(self, df: pd.DataFrame, timestamp: str):
@@ -173,8 +219,25 @@ class MetricsAnalyzer:
             return
         
         plt.figure(figsize=(12, 6))
-        sns.histplot(df['t_exec'], kde=True, bins=30, color='salmon')
-        plt.title('Distribuzione del Tempo di Esecuzione')
+        
+        # Controlla se tutti i valori sono identici o quasi
+        t_exec_min = df['t_exec'].min()
+        t_exec_max = df['t_exec'].max()
+        t_exec_range = t_exec_max - t_exec_min
+        
+        if t_exec_range < 1e-10:  # Se la gamma è troppo piccola
+            # Usa un grafico a barre semplice invece di un istogramma
+            plt.bar(['Execution Time'], [df['t_exec'].mean()], color='salmon')
+            plt.text(0, df['t_exec'].mean(), f"{df['t_exec'].mean():.4f}", 
+                    ha='center', va='bottom')
+            plt.title('Execution Time (constant value)')
+        else:
+            # Calcola il numero appropriato di bin
+            # Usa la regola di Sturges per determinare il numero ottimale di bin
+            n_bins = min(30, max(5, int(1 + 3.322 * np.log10(len(df)))))
+            sns.histplot(df['t_exec'], kde=True, bins=n_bins, color='salmon')
+            plt.title('Distribuzione del Tempo di Esecuzione')
+        
         plt.xlabel('Tempo di esecuzione (ms)')
         plt.ylabel('Frequenza')
         plt.tight_layout()

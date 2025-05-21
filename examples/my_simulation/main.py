@@ -15,9 +15,14 @@ from sim.faas import (
 )
 from sim.requestgen import function_trigger, constant_rps_profile, expovariate_arrival_profile, sine_rps_profile
 
-from .custom_topology import CloudFogEdgeTopology
+# Importiamo la topologia standard invece di quella personalizzata
+from sim.topology import Topology
+import ether.scenarios.urbansensing as scenario
+
+# Manteniamo gli import del custom scheduler e metrics analyzer
 from .custom_scheduler import CustomScheduler
 from .metrics_analyzer import MetricsAnalyzer
+from .custom_topology import CloudFogEdgeTopology
 
 # Configurazione del logging
 logging.basicConfig(
@@ -130,7 +135,8 @@ class CloudFogEdgeBenchmark(Benchmark):
             )[0]
             
             # Crea la richiesta con sorgente come metadato
-            request = FunctionRequest(function_name, labels={'source': source_node})
+            request = FunctionRequest(function_name)
+
             
             # Avvia l'invocazione
             env.process(env.faas.invoke(request))
@@ -284,69 +290,79 @@ def main():
     """
     Esegue la simulazione completa.
     """
-    # 1. Carica la configurazione
-    config = load_config()
+    from .docker_patch import patched_pull
+    import sim.docker
+    original_pull = sim.docker.pull
+    sim.docker.pull = patched_pull
     
-    # 2. Crea la topologia
-    topology_config = config['topology']
-    topology = CloudFogEdgeTopology(
-        num_fog_nodes=topology_config.get('num_fog_nodes', 3),
-        num_edge_nodes_per_fog=topology_config.get('num_edge_nodes_per_fog', 2)
-    )
+    try:
+        # 1. Carica la configurazione
+        config = load_config()
+        
+        # 2. Crea la topologia personalizzata
+        topology_config = config['topology']
+        topology = CloudFogEdgeTopology(
+            num_fog_nodes=topology_config.get('num_fog_nodes', 3),
+            num_edge_nodes_per_fog=topology_config.get('num_edge_nodes_per_fog', 2)
+        )
+        
+        # 3. Imposta le latenze personalizzate
+        custom_latencies = topology_config.get('custom_latencies', {})
+        for key, latency in custom_latencies.items():
+            parts = key.split('-')
+            if len(parts) >= 2:
+                source, dest = parts[0], '-'.join(parts[1:])
+                topology.set_custom_latency(source, dest, latency)
     
-    # 3. Imposta le latenze personalizzate
-    custom_latencies = topology_config.get('custom_latencies', {})
-    for key, latency in custom_latencies.items():
-        parts = key.split('-')
-        if len(parts) >= 2:
-            source, dest = parts[0], '-'.join(parts[1:])
-            topology.set_custom_latency(source, dest, latency)
+        # 4. Crea il benchmark
+        benchmark_config = config['benchmark']
+        benchmark = CloudFogEdgeBenchmark(
+            function_configs=config['functions'],
+            total_requests=benchmark_config.get('total_requests', 500),
+            rps=benchmark_config.get('rps', 20),
+            request_pattern=benchmark_config.get('request_pattern', 'constant'),
+            source_distribution=benchmark_config.get('source_distribution', {'cloud': 1.0})
+        )
+        
+        # 5. Configura la simulazione
+        sim = Simulation(topology, benchmark)
+        
+        # 6. Imposta lo scheduler personalizzato
+        scheduler_weights = config.get('scheduler', {}).get('weights', {})
+        
+        def create_scheduler(env):
+            scheduler = CustomScheduler.create(env, topology)
+            # Imposta i pesi dello scheduler se definiti
+            if 'alpha' in scheduler_weights:
+                scheduler.alpha = scheduler_weights['alpha']
+            if 'beta' in scheduler_weights:
+                scheduler.beta = scheduler_weights['beta']
+            if 'gamma' in scheduler_weights:
+                scheduler.gamma = scheduler_weights['gamma']
+            return scheduler
+        
+        sim.create_scheduler = create_scheduler
+        
+        # 7. Esegui la simulazione
+        logger.info("Avvio della simulazione...")
+        sim.run()
+        logger.info("Simulazione completata")
     
-    # 4. Crea il benchmark
-    benchmark_config = config['benchmark']
-    benchmark = CloudFogEdgeBenchmark(
-        function_configs=config['functions'],
-        total_requests=benchmark_config.get('total_requests', 500),
-        rps=benchmark_config.get('rps', 20),
-        request_pattern=benchmark_config.get('request_pattern', 'constant'),
-        source_distribution=benchmark_config.get('source_distribution', {'cloud': 1.0})
-    )
+        # 8. Analizza i risultati
+        metrics = {
+            'invocations_df': sim.env.metrics.extract_dataframe('invocations'),
+            'allocation_df': sim.env.metrics.extract_dataframe('allocation'),
+            'scale_df': sim.env.metrics.extract_dataframe('scale'),
+            'node_utilization_df': sim.env.metrics.extract_dataframe('node_utilization'),
+            'function_utilization_df': sim.env.metrics.extract_dataframe('function_utilization')
+        }
+        
+        analyzer = MetricsAnalyzer()
+        analyzer.analyze_simulation(metrics, config)
+        
+    finally:
+        # Ripristina la funzione originale
+        sim.docker.pull = original_pull
     
-    # 5. Configura la simulazione
-    sim = Simulation(topology, benchmark)
-    
-    # 6. Imposta lo scheduler personalizzato
-    scheduler_weights = config.get('scheduler', {}).get('weights', {})
-    
-    def create_scheduler(env):
-        scheduler = CustomScheduler.create(env, topology)
-        # Imposta i pesi dello scheduler se definiti
-        if 'alpha' in scheduler_weights:
-            scheduler.alpha = scheduler_weights['alpha']
-        if 'beta' in scheduler_weights:
-            scheduler.beta = scheduler_weights['beta']
-        if 'gamma' in scheduler_weights:
-            scheduler.gamma = scheduler_weights['gamma']
-        return scheduler
-    
-    sim.create_scheduler = create_scheduler
-    
-    # 7. Esegui la simulazione
-    logger.info("Avvio della simulazione...")
-    sim.run()
-    logger.info("Simulazione completata")
-    
-    # 8. Analizza i risultati
-    metrics = {
-        'invocations_df': sim.env.metrics.extract_dataframe('invocations'),
-        'allocation_df': sim.env.metrics.extract_dataframe('allocation'),
-        'scale_df': sim.env.metrics.extract_dataframe('scale'),
-        'node_utilization_df': sim.env.metrics.extract_dataframe('node_utilization'),
-        'function_utilization_df': sim.env.metrics.extract_dataframe('function_utilization')
-    }
-    
-    analyzer = MetricsAnalyzer()
-    analyzer.analyze_simulation(metrics, config)
-
 if __name__ == "__main__":
     main()
