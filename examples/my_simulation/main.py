@@ -1,3 +1,5 @@
+# Modifiche al file examples/my_simulation/main.py
+
 import logging
 import os
 import json
@@ -15,14 +17,15 @@ from sim.faas import (
 )
 from sim.requestgen import function_trigger, constant_rps_profile, expovariate_arrival_profile, sine_rps_profile
 
-# Importiamo la topologia standard invece di quella personalizzata
+# Importiamo la topologia standard
 from sim.topology import Topology
 import ether.scenarios.urbansensing as scenario
+from ether.core import Node, Capacity, Connection
+from sim.docker import DockerRegistry
 
 # Manteniamo gli import del custom scheduler e metrics analyzer
 from .custom_scheduler import CustomScheduler
 from .metrics_analyzer import MetricsAnalyzer
-from .custom_topology import CloudFogEdgeTopology
 
 # Configurazione del logging
 logging.basicConfig(
@@ -30,6 +33,225 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+import sim.docker
+from ether.core import Node
+# Salva la funzione originale
+original_docker_pull = sim.docker.pull
+
+# Definisci la funzione di patch direttamente qui
+def patched_docker_pull(env, image: str, node: Node):
+    """
+    Versione semplificata di docker pull che simula un trasferimento diretto.
+    """
+    logger.info(f"Simulando pull di {image} su {node.name}")
+    
+    # Simula un tempo di trasferimento basato sulla dimensione dell'immagine
+    # Prova a ottenere la dimensione dell'immagine dal registry
+    size = 58 * 1024 * 1024  # Default: 58MB
+    
+    try:
+        registry = env.container_registry
+        for tag_dict in registry.images.values():
+            for images in tag_dict.values():
+                for img in images:
+                    if img.name == image:
+                        size = img.size
+                        break
+    except Exception as e:
+        logger.warning(f"Errore nel determinare la dimensione dell'immagine: {e}")
+    
+    # Simula una velocità di trasferimento di 100 MB/s
+    transfer_time = size / (100 * 1024 * 1024)
+    logger.info(f"Simulando trasferimento di {size/(1024*1024):.1f} MB in {transfer_time:.2f} secondi")
+    
+    # Simula il trasferimento
+    yield env.timeout(transfer_time)
+    logger.info(f"Completato pull di {image} su {node.name}")
+
+
+class ModifiedTopology(Topology):
+    """
+    Topologia modificata basata su UrbanSensing con nodi cloud, fog ed edge aggiuntivi.
+    """
+    def __init__(self, num_fog_nodes=3, num_edge_nodes_per_fog=2, custom_latencies=None):
+        super().__init__()
+        
+        # Configura la topologia base usando lo scenario esistente
+        scenario.UrbanSensingScenario().materialize(self)
+        
+        # Attributi per tenere traccia dei nodi
+        self.cloud_nodes = []
+        self.fog_nodes = []
+        self.edge_nodes = []
+        self.custom_latencies = custom_latencies or {}
+        
+        self.num_fog_nodes = num_fog_nodes
+        self.num_edge_nodes_per_fog = num_edge_nodes_per_fog
+        
+        # Inizializza il registry Docker
+        self.init_docker_registry()
+        
+        # Personalizza la topologia
+        self.customize_topology()
+        
+    def customize_topology(self):
+        """
+        Estende la topologia con nodi cloud, fog ed edge personalizzati.
+        """
+        # Aggiungi il nodo cloud
+        cloud_node = Node("cloud", Capacity(
+            cpu_millis=32000,  # 32 CPU (aumentato)
+            memory=64 * 1024 * 1024 * 1024  # 64 GB (aumentato)
+        ))
+        cloud_node.labels = {"role": "cloud", "zone": "datacenter"}
+        self.add_node(cloud_node)
+        self.cloud_nodes.append(cloud_node)
+        
+        # Aggiungi nodi fog
+        for i in range(self.num_fog_nodes):
+            fog_node = Node(f"fog-{i}", Capacity(
+                cpu_millis=16000,  # 16 CPU (aumentato)
+                memory=32 * 1024 * 1024 * 1024  # 32 GB (aumentato)
+            ))
+            fog_node.labels = {"role": "fog", "zone": f"zone-{i}"}
+            self.add_node(fog_node)
+            self.fog_nodes.append(fog_node)
+            
+            # Collega cloud a fog
+            self.add_edge(cloud_node, fog_node, latency=20, weight=1)
+            self.add_edge(fog_node, cloud_node, latency=20, weight=1)
+            
+            # Aggiungi nodi edge per ogni fog
+            for j in range(self.num_edge_nodes_per_fog):
+                edge_node = Node(f"edge-{i}-{j}", Capacity(
+                    cpu_millis=8000,  # 8 CPU (aumentato)
+                    memory=16 * 1024 * 1024 * 1024  # 16 GB (aumentato)
+                ))
+                edge_node.labels = {
+                    "role": "edge", 
+                    "zone": f"zone-{i}", 
+                    "parent": f"fog-{i}"
+                }
+                self.add_node(edge_node)
+                self.edge_nodes.append(edge_node)
+                
+                # Collega fog a edge
+                self.add_edge(fog_node, edge_node, latency=5, weight=1)
+                self.add_edge(edge_node, fog_node, latency=5, weight=1)
+        
+        # Collega fog tra loro
+        for i in range(self.num_fog_nodes):
+            for j in range(i + 1, self.num_fog_nodes):
+                self.add_edge(self.fog_nodes[i], self.fog_nodes[j], latency=15, weight=1)
+                self.add_edge(self.fog_nodes[j], self.fog_nodes[i], latency=15, weight=1)
+        
+        # Applica latenze personalizzate
+        self.apply_custom_latencies()
+        
+        # Assicurati che tutti i nodi siano collegati al registry
+        self.connect_registry_to_all_nodes()
+        
+        logger.info("Topologia personalizzata creata con successo")
+    
+    def apply_custom_latencies(self):
+        """Applica latenze personalizzate specificate nella configurazione"""
+        for key, latency in self.custom_latencies.items():
+            try:
+                parts = key.split('-')
+                if len(parts) >= 2:
+                    # Estrai i nomi dei nodi
+                    if parts[0] == 'cloud':
+                        source = 'cloud'
+                        target = '-'.join(parts[1:])
+                    else:
+                        source = '-'.join(parts[:len(parts)//2])
+                        target = '-'.join(parts[len(parts)//2:])
+                    
+                    # Aggiorna la latenza se esiste un edge
+                    edge_data = self.get_edge_data(source, target)
+                    if edge_data:
+                        edge_data['latency'] = latency
+                        logger.debug(f"Aggiornata latenza tra {source} e {target} a {latency}ms")
+            except Exception as e:
+                logger.warning(f"Errore nell'applicare la latenza personalizzata per {key}: {e}")
+    
+    def connect_registry_to_all_nodes(self):
+        """
+        Connette esplicitamente il registry Docker a tutti i nodi della topologia.
+        """
+        # Trova il nodo registry
+        registry = None
+        for node in self.nodes():
+            if hasattr(node, 'name') and node.name == 'registry':
+                registry = node
+                break
+        
+        if not registry:
+            logger.warning("Registry Docker non trovato nella topologia!")
+            return
+        
+        # Connetti il registry a tutti i nodi
+        connections_added = 0
+        for node in self.cloud_nodes + self.fog_nodes + self.edge_nodes:
+            if node != registry:
+                try:
+                    # Usa add_edge per aggiungere l'arco direttamente al grafo NetworkX
+                    if not self.has_edge(registry, node):
+                        self.add_edge(registry, node, weight=1, latency=5, capacity=1e6)
+                        connections_added += 1
+                    
+                    if not self.has_edge(node, registry):
+                        self.add_edge(node, registry, weight=1, latency=5, capacity=1e6)
+                        connections_added += 1
+                except Exception as e:
+                    logger.warning(f"Errore nel collegare registry a {node.name}: {e}")
+        
+        # Connetti anche ai nodi della topologia base
+        for node in self.nodes():
+            if node != registry and node not in (self.cloud_nodes + self.fog_nodes + self.edge_nodes):
+                try:
+                    if not self.has_edge(registry, node):
+                        self.add_edge(registry, node, weight=1, latency=5, capacity=1e6)
+                        connections_added += 1
+                    
+                    if not self.has_edge(node, registry):
+                        self.add_edge(node, registry, weight=1, latency=5, capacity=1e6)
+                        connections_added += 1
+                except Exception as e:
+                    logger.warning(f"Errore nel collegare registry a {node.name}: {e}")
+        
+        logger.info(f"Registry Docker connesso a {connections_added//2} nodi in modo bidirezionale")
+    
+    def get_nodes(self) -> List[Node]:
+        """
+        Restituisce tutti i nodi nella topologia, escludendo i Link.
+        
+        Returns:
+            Lista di tutti i nodi Node
+        """
+        # Filtra solo gli oggetti di tipo Node
+        return [node for node in self.nodes() 
+                if isinstance(node, Node) and hasattr(node, 'capacity')]
+    
+    def get_nodes_by_role(self, role: str) -> List[Node]:
+        """
+        Restituisce i nodi per ruolo specifico.
+        
+        Args:
+            role: Ruolo del nodo ('cloud', 'fog', 'edge')
+            
+        Returns:
+            Lista di nodi con il ruolo specificato
+        """
+        return [node for node in self.get_nodes() if hasattr(node, 'labels') and node.labels.get('role') == role]
+    
+    def find_node(self, node_name):
+        """Trova un nodo per nome."""
+        for node in self.nodes():
+            if hasattr(node, 'name') and node.name == node_name:
+                return node
+        return None
 
 class CloudFogEdgeBenchmark(Benchmark):
     """
@@ -135,8 +357,7 @@ class CloudFogEdgeBenchmark(Benchmark):
             )[0]
             
             # Crea la richiesta con sorgente come metadato
-            request = FunctionRequest(function_name)
-
+            request = FunctionRequest(function_name, labels={"source": source_node})
             
             # Avvia l'invocazione
             env.process(env.faas.invoke(request))
@@ -241,8 +462,8 @@ def load_config(config_file: str = "config.json") -> Dict:
                 "cpu": 200,
                 "memory": 268435456,
                 "weight": 0.5,
-                "min_replicas": 2,
-                "max_replicas": 5
+                "min_replicas": 1,
+                "max_replicas": 1
             },
             {
                 "name": "resnet50-inference",
@@ -252,7 +473,7 @@ def load_config(config_file: str = "config.json") -> Dict:
                 "memory": 1073741824,
                 "weight": 0.5,
                 "min_replicas": 1,
-                "max_replicas": 3
+                "max_replicas": 1
             }
         ],
         "benchmark": {
@@ -286,35 +507,28 @@ def load_config(config_file: str = "config.json") -> Dict:
     
     return default_config
 
+
 def main():
     """
     Esegue la simulazione completa.
     """
-    from .docker_patch import patched_pull
-    import sim.docker
-    original_pull = sim.docker.pull
-    sim.docker.pull = patched_pull
-    
     try:
         # 1. Carica la configurazione
-        config = load_config()
+        import argparse
+        parser = argparse.ArgumentParser(description='Run a FaaS simulation')
+        parser.add_argument('--config', type=str, default='config.json', help='Path to config file')
+        args = parser.parse_args()
+        config = load_config(args.config)
         
         # 2. Crea la topologia personalizzata
         topology_config = config['topology']
-        topology = CloudFogEdgeTopology(
+        topology = ModifiedTopology(
             num_fog_nodes=topology_config.get('num_fog_nodes', 3),
-            num_edge_nodes_per_fog=topology_config.get('num_edge_nodes_per_fog', 2)
+            num_edge_nodes_per_fog=topology_config.get('num_edge_nodes_per_fog', 2),
+            custom_latencies=topology_config.get('custom_latencies', {})
         )
         
-        # 3. Imposta le latenze personalizzate
-        custom_latencies = topology_config.get('custom_latencies', {})
-        for key, latency in custom_latencies.items():
-            parts = key.split('-')
-            if len(parts) >= 2:
-                source, dest = parts[0], '-'.join(parts[1:])
-                topology.set_custom_latency(source, dest, latency)
-    
-        # 4. Crea il benchmark
+        # 3. Crea il benchmark
         benchmark_config = config['benchmark']
         benchmark = CloudFogEdgeBenchmark(
             function_configs=config['functions'],
@@ -324,10 +538,10 @@ def main():
             source_distribution=benchmark_config.get('source_distribution', {'cloud': 1.0})
         )
         
-        # 5. Configura la simulazione
+        # 4. Configura la simulazione
         sim = Simulation(topology, benchmark)
         
-        # 6. Imposta lo scheduler personalizzato
+        # 5. Imposta lo scheduler personalizzato
         scheduler_weights = config.get('scheduler', {}).get('weights', {})
         
         def create_scheduler(env):
@@ -343,12 +557,12 @@ def main():
         
         sim.create_scheduler = create_scheduler
         
-        # 7. Esegui la simulazione
+        # 6. Esegui la simulazione
         logger.info("Avvio della simulazione...")
         sim.run()
         logger.info("Simulazione completata")
     
-        # 8. Analizza i risultati
+        # 7. Analizza i risultati
         metrics = {
             'invocations_df': sim.env.metrics.extract_dataframe('invocations'),
             'allocation_df': sim.env.metrics.extract_dataframe('allocation'),
@@ -360,9 +574,8 @@ def main():
         analyzer = MetricsAnalyzer()
         analyzer.analyze_simulation(metrics, config)
         
-    finally:
-        # Ripristina la funzione originale
-        sim.docker.pull = original_pull
-    
+    except Exception as e:
+        logger.error(f"Errore durante l'esecuzione della simulazione: {e}", exc_info=True)
+        
 if __name__ == "__main__":
     main()

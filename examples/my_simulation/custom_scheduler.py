@@ -7,18 +7,16 @@ from skippy.core.model import SchedulingResult, Pod
 
 from sim.core import Environment
 from ether.core import Node
-from .custom_topology import CloudFogEdgeTopology
+from sim.topology import Topology
+from sim.docker import DockerRegistry
 
 logger = logging.getLogger(__name__)
 
 class CustomScheduler:
     """
-    Scheduler personalizzato che seleziona il miglior nodo in base a:
-    - Utilizzo delle risorse
-    - Bilanciamento delle risorse
-    - Latenza di rete
+    Scheduler personalizzato con debug avanzato per la simulazione FaaS.
     """
-    def __init__(self, cluster: ClusterContext, topology: CloudFogEdgeTopology):
+    def __init__(self, cluster: ClusterContext, topology: Topology):
         """
         Inizializza lo scheduler.
         
@@ -34,196 +32,134 @@ class CustomScheduler:
         self.beta = 0.2   # Peso per il bilanciamento delle risorse
         self.gamma = 0.4  # Peso per la latenza di rete
         
+        # Debug della topologia all'inizializzazione
+        self._debug_topology()
+        
         # Risorse disponibili per ogni nodo
         self.available_resources = {}
-        for node in self.topology.get_nodes():
-            self.available_resources[node.name] = {
-                'cpu_millis': node.capacity.cpu_millis,
-                'memory': node.capacity.memory
-            }
+        for node in self.topology.nodes():
+            # Verifica che sia un nodo effettivo e non un Link o altro oggetto
+            if hasattr(node, 'capacity') and isinstance(node, Node):
+                self.available_resources[node.name] = {
+                    'cpu_millis': node.capacity.cpu_millis if hasattr(node.capacity, 'cpu_millis') else 8000,
+                    'memory': node.capacity.memory if hasattr(node.capacity, 'memory') else 8*1024*1024*1024
+                }
         
         logger.debug("Scheduler inizializzato con successo")
     
-    def score_nodes(self, nodes: List[Node], source_node: str, pod: Pod) -> Optional[Node]:
-        """
-        Calcola un punteggio per ogni nodo candidato e seleziona il migliore.
-        
-        Args:
-            nodes: Lista di nodi candidati
-            source_node: Nome del nodo sorgente (da cui parte la richiesta)
-            pod: Pod da schedulare
+    def _debug_topology(self):
+        """Debug della struttura della topologia"""
+        try:
+            all_nodes = list(self.topology.nodes())
+            topology_nodes = [n for n in all_nodes if isinstance(n, Node)]
+            link_nodes = [n for n in all_nodes if not isinstance(n, Node)]
             
-        Returns:
-            Il miglior nodo o None se nessun nodo è adatto
-        """
-        # Estrai le richieste di risorse dal pod
-        cpup = pod.spec.containers[0].resources.requests.get('cpu', 0) / 1000
-        memp = pod.spec.containers[0].resources.requests.get('memory', 0) / (1024 * 1024)
-        
-        resource_scores = {}
-        
-        for node in nodes:
-            name = node.name
+            logger.info(f"TOPOLOGIA DEBUG - Totale nodi: {len(all_nodes)}, "
+                       f"Nodi effettivi: {len(topology_nodes)}, "
+                       f"Link o altro: {len(link_nodes)}")
             
-            # Risorse disponibili
-            available = self.available_resources.get(name, {})
-            totcpun = available.get('cpu_millis', 0) / 1000
-            totmemn = available.get('memory', 0) / (1024 * 1024)
+            # Debug dei nodi con nome
+            named_nodes = [n for n in topology_nodes if hasattr(n, 'name')]
             
-            # Calcola risorse residue dopo allocazione
-            residual_cpu = totcpun - cpup
-            residual_mem = totmemn - memp
+            # Mostra i primi 10 nomi
+            if named_nodes:
+                node_names = [n.name for n in named_nodes[:10]]
+                logger.info(f"Esempi di nodi: {', '.join(node_names)}")
+                
+            # Verifica se è presente il registry
+            registry_node = next((n for n in all_nodes if hasattr(n, 'name') and n.name == 'registry'), None)
+            logger.info(f"Registry presente: {'Sì' if registry_node else 'No'}")
             
-            # Verifica se ci sono risorse sufficienti
-            if residual_cpu < 0 or residual_mem < 0:
-                logger.debug(f"Nodo {name} non ha risorse sufficienti per il pod {pod.name}")
-                continue
-            
-            # Calcola la deviazione standard delle risorse residue (bilanciamento)
-            residuals = [residual_cpu, residual_mem]
-            resource_std = statistics.stdev(residuals) if len(residuals) > 1 else 0
-            
-            # Normalizza la deviazione standard
-            sum_residuals = sum(residuals)
-            max_std = 0.5 * sum_residuals if sum_residuals > 0 else 1.0
-            normalized_resource_std = min(resource_std / max_std, 1.0)
-            
-            # Calcola il punteggio di utilizzo
-            sum_requests = cpup + memp
-            sum_capacity = totcpun + totmemn
-            utilization_score = sum_requests / sum_capacity if sum_capacity > 0 else 0
-            
-            # Calcola il punteggio di latenza
-            latency = self.topology.get_latency(source_node, name)
-            max_latency = 100.0  # Latenza massima ipotizzata
-            normalized_latency = min(latency / max_latency, 1.0)
-            latency_score = 1.0 - normalized_latency  # Punteggio più alto per latenza più bassa
-            
-            # Calcola il punteggio finale
-            final_score = (
-                self.alpha * utilization_score +
-                self.beta * (1 - normalized_resource_std) +
-                self.gamma * latency_score
-            )
-            
-            resource_scores[name] = final_score
-            
-            logger.debug(
-                f"Nodo {name} - "
-                f"Util={utilization_score:.2f}, "
-                f"Bilanciamento={1-normalized_resource_std:.2f}, "
-                f"Latenza={latency_score:.2f}, "
-                f"Score finale={final_score:.2f}"
-            )
-        
-        if not resource_scores:
-            return None
-        
-        best_node_name = max(resource_scores, key=resource_scores.get)
-        return self.topology.find_node(best_node_name)
-    
-    def update_resources(self, node: Node, pod: Pod):
-        """
-        Aggiorna le risorse disponibili di un nodo dopo l'allocazione di un pod.
-        
-        Args:
-            node: Nodo su cui è stato allocato il pod
-            pod: Pod allocato
-        """
-        name = node.name
-        cpup = pod.spec.containers[0].resources.requests.get('cpu', 0) / 1000
-        memp = pod.spec.containers[0].resources.requests.get('memory', 0) / (1024 * 1024)
-        
-        logger.debug(f"Aggiornamento risorse per {name}: CPU={cpup}, Mem={memp}")
-        
-        self.available_resources[name]['cpu_millis'] -= cpup * 1000
-        self.available_resources[name]['memory'] -= memp * 1024 * 1024
+            # Verifica attributi 'get_nodes' se presenti
+            if hasattr(self.topology, 'get_nodes'):
+                topology_get_nodes = list(self.topology.get_nodes())
+                logger.info(f"Nodi restituiti da get_nodes(): {len(topology_get_nodes)}")
+        except Exception as e:
+            logger.error(f"Errore nel debug della topologia: {e}")
     
     def schedule(self, pod: Pod) -> SchedulingResult:
         """
-        Schedula un pod sul miglior nodo disponibile.
-        Adattato per funzionare sia con la topologia personalizzata che standard.
+        Versione di debug che tenta diversi approcci per trovare un nodo disponibile.
         """
-        # Determina il nodo sorgente dalla richiesta
-        source_node = 'cloud'
-        if hasattr(pod, 'labels') and isinstance(pod.labels, dict):
-            source_node = pod.labels.get('source', 'cloud')
+        logger.debug(f"Scheduling pod {pod.name}")
         
-        logger.debug(f"Schedulazione pod {pod.name} con sorgente: {source_node}")
+        # TENTATIVO 1: Usa i nodi direttamente dalla topologia
+        try:
+            # Otteniamo i nodi dalla topologia, filtrando solo quelli validi
+            topology_nodes = list(self.topology.nodes())
+            valid_nodes = [n for n in topology_nodes 
+                        if isinstance(n, Node) and 
+                           hasattr(n, 'name') and
+                           n.name != 'registry' and
+                           hasattr(n, 'capacity')]
+            
+            logger.debug(f"Trovati {len(valid_nodes)} nodi validi nella topologia")
+            
+            # Se abbiamo nodi validi, usa il primo
+            if valid_nodes:
+                node = valid_nodes[0]
+                logger.info(f"Schedulando {pod.name} su {node.name} (dalla topologia)")
+                return SchedulingResult(node, len(valid_nodes), [])
+        except Exception as e:
+            logger.warning(f"Errore nell'approccio 1 - topologia: {e}")
         
-        # Ottieni tutti i nodi disponibili
-        nodes = self.cluster.list_nodes()
+        # TENTATIVO 2: Usa direttamente i nodi cloud/fog/edge se la topologia li ha
+        try:
+            if hasattr(self.topology, 'cloud_nodes') and self.topology.cloud_nodes:
+                node = self.topology.cloud_nodes[0]
+                logger.info(f"Schedulando {pod.name} su {node.name} (cloud)")
+                return SchedulingResult(node, 1, [])
+            
+            if hasattr(self.topology, 'fog_nodes') and self.topology.fog_nodes:
+                node = self.topology.fog_nodes[0]
+                logger.info(f"Schedulando {pod.name} su {node.name} (fog)")
+                return SchedulingResult(node, 1, [])
+                
+            if hasattr(self.topology, 'edge_nodes') and self.topology.edge_nodes:
+                node = self.topology.edge_nodes[0]
+                logger.info(f"Schedulando {pod.name} su {node.name} (edge)")
+                return SchedulingResult(node, 1, [])
+        except Exception as e:
+            logger.warning(f"Errore nell'approccio 2 - nodi specifici: {e}")
         
-        # Calcola i punteggi per ogni nodo
-        scores = {}
-        for node in nodes:
-            # Estrai le richieste di risorse dal pod
-            cpup = pod.spec.containers[0].resources.requests.get('cpu', 0) / 1000
-            memp = pod.spec.containers[0].resources.requests.get('memory', 0) / (1024 * 1024)
+        # TENTATIVO 3: Usa i nodi dal cluster
+        try:
+            cluster_nodes = list(self.cluster.list_nodes())
+            logger.debug(f"Trovati {len(cluster_nodes)} nodi nel cluster")
             
-            # Capacità del nodo
-            totcpun = node.capacity.cpu_millis / 1000 if hasattr(node, 'capacity') else 8
-            totmemn = node.capacity.memory / (1024 * 1024) if hasattr(node, 'capacity') else 16384
-            
-            # Verifica se ci sono risorse sufficienti
-            residual_cpu = totcpun - cpup
-            residual_mem = totmemn - memp
-            
-            if residual_cpu < 0 or residual_mem < 0:
-                logger.debug(f"Nodo {node.name} non ha risorse sufficienti per il pod {pod.name}")
-                continue
-            
-            # Calcola punteggio di utilizzo
-            utilization_score = (cpup + memp) / (totcpun + totmemn) if (totcpun + totmemn) > 0 else 0
-            
-            # Calcola punteggio di bilanciamento (deviazione standard delle risorse residue)
-            resource_std = 0
-            if residual_cpu > 0 and residual_mem > 0:
-                import statistics
-                resource_std = statistics.stdev([residual_cpu, residual_mem])
-            
-            # Normalizza
-            sum_residuals = residual_cpu + residual_mem
-            max_std = 0.5 * sum_residuals if sum_residuals > 0 else 1.0
-            normalized_resource_std = min(resource_std / max_std, 1.0) if max_std > 0 else 0
-            
-            # Calcola punteggio di latenza (semplificato per la topologia standard)
-            # Useremo la distanza nel nome del nodo come approssimazione della latenza
-            # Ad es., se il source_node è 'cloud', i nodi con 'cloud' nel nome avranno score alto
-            latency_score = 0.8
-            if source_node in node.name:
-                latency_score = 1.0
-            elif ('gateway' in node.name and 'gateway' in source_node) or ('sensor' in node.name and 'sensor' in source_node):
-                latency_score = 0.9
-            
-            # Calcola punteggio finale
-            final_score = (
-                self.alpha * utilization_score +
-                self.beta * (1 - normalized_resource_std) +
-                self.gamma * latency_score
-            )
-            
-            scores[node.name] = final_score
-            logger.debug(f"Nodo {node.name} - Score: {final_score:.2f}")
+            if cluster_nodes:
+                for node in cluster_nodes:
+                    if hasattr(node, 'name') and node.name != 'registry':
+                        logger.info(f"Schedulando {pod.name} su {node.name} (dal cluster)")
+                        return SchedulingResult(node, len(cluster_nodes), [])
+        except Exception as e:
+            logger.warning(f"Errore nell'approccio 3 - cluster: {e}")
         
-        # Seleziona il miglior nodo
-        if not scores:
-            logger.warning(f"Nessun nodo disponibile per il pod {pod.name}")
-            return SchedulingResult(None, len(nodes), ['Nessun nodo disponibile'])
+        # TENTATIVO 4: Crea un nodo artificiale
+        try:
+            # Questo è un approccio estremo, ma può aiutare a diagnosticare cosa non va
+            logger.warning("Creazione di un nodo artificiale per la schedulazione")
+            
+            from skippy.core.model import Node as SkippyNode
+            from skippy.core.model import NodeResources
+            
+            # Crea un nodo Skippy artificiale
+            resources = NodeResources(16, 32 * 1024)  # 16 CPU, 32GB RAM
+            artificial_node = SkippyNode("artificial-node", resources)
+            
+            logger.info(f"Schedulando {pod.name} su {artificial_node.name} (artificiale)")
+            return SchedulingResult(artificial_node, 1, ["Nodo artificiale"])
+        except Exception as e:
+            logger.error(f"Errore nel tentativo di creare un nodo artificiale: {e}")
+            
+        # Se tutti gli approcci falliscono
+        logger.error(f"Tutti gli approcci falliti per {pod.name}")
         
-        best_node_name = max(scores, key=scores.get)
-        best_node = next((n for n in nodes if n.name == best_node_name), None)
-        
-        if best_node:
-            logger.info(f"Pod {pod.name} schedulato su {best_node.name}")
-            return SchedulingResult(best_node, len(nodes), [])
-        else:
-            logger.warning(f"Impossibile trovare il nodo selezionato: {best_node_name}")
-            return SchedulingResult(None, len(nodes), ['Nodo non trovato'])
-    
+        # Restituisci un risultato vuoto ma valido
+        return SchedulingResult(None, 0, ["Nessun nodo trovato dopo tutti i tentativi"])
     
     @staticmethod
-    def create(env: Environment, topology: CloudFogEdgeTopology):
+    def create(env: Environment, topology: Topology):
         """
         Factory method per creare un'istanza dello scheduler.
         
